@@ -118,6 +118,8 @@ type Driver struct {
 
 	SpotInstanceRequestId string
 	SpotFleetRequestId    string
+	InstanceOverrides     []string
+	LaunchTemplateName    string
 }
 
 type clientFactory interface {
@@ -182,6 +184,14 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 		mcnflag.StringSliceFlag{
 			Name:  "amazonec2-open-port",
 			Usage: "Make the specified port number accessible from the Internet",
+		},
+		mcnflag.StringSliceFlag{
+			Name:  "amazonec2-fleet-instance-overrides",
+			Usage: "Make override instance types for given launch template",
+		},
+		mcnflag.StringFlag{
+			Name:  "amazonec2-fleet-launch-template-name",
+			Usage: "Specify the name of the launch template to use for spot fleet",
 		},
 		mcnflag.StringFlag{
 			Name:   "amazonec2-tags",
@@ -378,6 +388,8 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.RequestSpotFleet = flags.Bool("amazonec2-request-spot-fleet")
 	d.SpotPrice = flags.String("amazonec2-spot-price")
 	d.IamFleetRole = flags.String("amazonec2-iam-fleet-role")
+	d.InstanceOverrides = flags.StringSlice("amazonec2-fleet-instance-overrides")
+	d.LaunchTemplateName = flags.String("amazonec2-fleet-launch-template-name")
 	d.BlockDurationMinutes = int64(flags.Int("amazonec2-block-duration-minutes"))
 	d.InstanceType = flags.String("amazonec2-instance-type")
 	d.VpcId = flags.String("amazonec2-vpc-id")
@@ -777,40 +789,51 @@ func (d *Driver) innerCreate() error {
 		}
 
 	} else if d.RequestSpotFleet {
-		var securityGroupIds = makePointerSlice(d.securityGroupIds())
-		var securityGroups = []*ec2.GroupIdentifier{}
-		for i := range securityGroupIds {
-			securityGroups = append(securityGroups, &ec2.GroupIdentifier{
-				GroupId: securityGroupIds[i],
+		var instanceOverrides = makePointerSlice(d.InstanceOverrides)
+		var launchTemplateOverrides = []*ec2.LaunchTemplateOverrides{}
+		var subnetId = strings.Join(d.SubnetIds, ",")
+
+		for i := range instanceOverrides {
+			launchTemplateOverrides = append(launchTemplateOverrides, &ec2.LaunchTemplateOverrides{
+				InstanceType: instanceOverrides[i],
+				SubnetId:     aws.String(subnetId),
 			})
 		}
 
-		var subnetId = strings.Join(d.SubnetIds,",")
+		resolvedLaunchTemplateVersion, err := d.getClient().DescribeLaunchTemplateVersions(&ec2.DescribeLaunchTemplateVersionsInput{
+			LaunchTemplateName: aws.String(d.LaunchTemplateName),
+			Filters: []*ec2.Filter{
+				{
+					Name:   aws.String("is-default-version"),
+					Values: makePointerSlice([]string{"true"}),
+				},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("Error describing launch template: %v", err)
+		}
 		log.Debugf("launching spot fleet in subnet [%s]", subnetId)
 
-		var validUntil = time.Now().AddDate(1, 0, 0);
+		launchTemplateVersion := resolvedLaunchTemplateVersion.LaunchTemplateVersions[0].VersionNumber
+
+		var validUntil = time.Now().AddDate(1, 0, 0)
 		req := ec2.RequestSpotFleetInput{
 			DryRun: aws.Bool(false),
 			SpotFleetRequestConfig: &ec2.SpotFleetRequestConfigData{
-				AllocationStrategy: aws.String("lowestPrice"),
-				TargetCapacity: aws.Int64(1),
-				ValidUntil: &validUntil,
+				AllocationStrategy:               aws.String("lowestPrice"),
+				TargetCapacity:                   aws.Int64(1),
+				ValidUntil:                       &validUntil,
 				TerminateInstancesWithExpiration: aws.Bool(true),
-				IamFleetRole: &d.IamFleetRole,
-				Type: aws.String("request"),
-				SpotPrice: &d.SpotPrice,
-				LaunchSpecifications: []*ec2.SpotFleetLaunchSpecification{
+				IamFleetRole:                     &d.IamFleetRole,
+				Type:                             aws.String("request"),
+				SpotPrice:                        &d.SpotPrice,
+				LaunchTemplateConfigs: []*ec2.LaunchTemplateConfig{
 					{
-						ImageId: &d.AMI,
-						InstanceType: &d.InstanceType,
-						SubnetId: &subnetId,
-						SpotPrice: &d.SpotPrice,
-						Monitoring: &ec2.SpotFleetMonitoring{Enabled: aws.Bool(d.Monitoring)},
-						KeyName: &d.KeyName,
-						EbsOptimized: &d.UseEbsOptimizedInstance,
-						BlockDeviceMappings: []*ec2.BlockDeviceMapping{bdm},
-						UserData: &userdata,
-						SecurityGroups: securityGroups,
+						LaunchTemplateSpecification: &ec2.FleetLaunchTemplateSpecification{
+							LaunchTemplateName: &d.LaunchTemplateName,
+							Version:            aws.String(strconv.FormatInt(aws.Int64Value(launchTemplateVersion), 10)),
+						},
+						Overrides: launchTemplateOverrides,
 					},
 				},
 			},
@@ -843,13 +866,13 @@ func (d *Driver) innerCreate() error {
 
 			if len(resolvedSpotFleetInstance.ActiveInstances) == 0 {
 				time.Sleep(5 * time.Second)
-				continue;
+				continue
 			}
 
 			spotInstanceRequestId = resolvedSpotFleetInstance.ActiveInstances[0].SpotInstanceRequestId
 			if spotInstanceRequestId == nil || *spotInstanceRequestId == "" {
 				time.Sleep(5 * time.Second)
-				continue;
+				continue
 			}
 
 			log.Debugf("Spot instance with request id %s fulfilled", *spotInstanceRequestId)
@@ -1136,7 +1159,7 @@ func (d *Driver) cancelSpotFleetRequest() error {
 
 	_, err := d.getClient().CancelSpotFleetRequests(&ec2.CancelSpotFleetRequestsInput{
 		SpotFleetRequestIds: []*string{&d.SpotFleetRequestId},
-		TerminateInstances: aws.Bool(true),
+		TerminateInstances:  aws.Bool(true),
 	})
 
 	return err
